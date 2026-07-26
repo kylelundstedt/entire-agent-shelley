@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 PROTOCOL_VERSION = 1
+PLUGIN_VERSION = "0.1.0"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOOK_NAMES = (
     "session-start",
@@ -1042,6 +1043,10 @@ def command_are_hooks_installed() -> None:
     emit({"installed": hooks_installed()})
 
 
+def command_version() -> None:
+    emit({"name": "entire-agent-shelley", "version": PLUGIN_VERSION})
+
+
 def command_info() -> None:
     emit(
         {
@@ -1179,7 +1184,9 @@ def main() -> None:
     parser.add_argument("command", nargs="?")
     parsed, rest = parser.parse_known_args()
     command = parsed.command
-    if command == "info":
+    if command == "version":
+        command_version()
+    elif command == "info":
         command_info()
     elif command == "detect":
         command_detect()

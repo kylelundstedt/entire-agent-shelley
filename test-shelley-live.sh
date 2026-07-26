@@ -5,7 +5,7 @@ ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 
 ADAPTER=$(cd "$(dirname "$0")" && pwd)/entire-agent-shelley
-REAL_ENTIRE=$(command -v entire)
+REAL_ENTIRE=$(command -v entire || true)
 TEST_HOME="$ROOT/home"
 REPO="$ROOT/repo"
 DB="$TEST_HOME/.config/shelley/shelley.db"
@@ -17,7 +17,11 @@ mkdir -p "$BIN" "$HOOKS" "$(dirname "$DB")"
 ln -s "$ADAPTER" "$BIN/entire-agent-shelley"
 
 export HOME="$TEST_HOME"
-export PATH="$BIN:$(dirname "$REAL_ENTIRE"):/usr/bin:/bin"
+if [[ -n "$REAL_ENTIRE" ]]; then
+  export PATH="$BIN:$(dirname "$REAL_ENTIRE"):/usr/bin:/bin"
+else
+  export PATH="$BIN:/usr/bin:/bin"
+fi
 export SHELLEY_DB="$DB"
 export SHELLEY_HOOKS_DIR="$HOOKS"
 export ENTIRE_SHELLEY_HOOK_STATE="$STATE"
@@ -150,6 +154,10 @@ assert_jq "$INSTALL" '.hooks_installed == 0'
 
 # Full real-Entire lifecycle: live TurnEnd materializes Shelley SQLite directly,
 # commit condensation adds a trailer, and the checkpoint ref carries transcript.
+if [[ ${ENTIRE_SKIP_REAL:-0} == 1 ]]; then
+  echo "SKIP: real Entire lifecycle integration"
+else
+  [[ -n "$REAL_ENTIRE" ]] || fail "Entire CLI is required unless ENTIRE_SKIP_REAL=1"
 (
   cd "$REPO"
   entire enable --agent shelley --project --telemetry=false --checkpoint-backend branch >/dev/null
@@ -187,6 +195,7 @@ CHECKPOINT_TREE=$(git -C "$REPO" ls-tree -r --name-only entire/checkpoints/v1)
 grep -q '/transcript.jsonl$' <<<"$CHECKPOINT_TREE" || fail "checkpoint transcript missing"
 TRANSCRIPT_PATH=$(grep '/transcript.jsonl$' <<<"$CHECKPOINT_TREE" | head -1)
 git -C "$REPO" show "entire/checkpoints/v1:$TRANSCRIPT_PATH" | grep -q '"text":"done"' || fail "direct Shelley transcript content missing"
+fi
 
 # Global Shelley hooks are reference-counted across Entire-enabled repositories.
 REPO2="$ROOT/repo-two"
