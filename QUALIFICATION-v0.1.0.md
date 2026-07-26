@@ -241,3 +241,97 @@ checkpoints  1
 ## Readiness verdict
 
 `v0.1.0` passes qualification on `iv-entire-agent-shelley` and is ready for installation on Stage 2 authoring VMs.
+
+## Narrow follow-up: real overlap of delayed asynchronous end-of-turn and next chat-message
+
+Date: 2026-07-26 UTC
+
+A second disposable synthetic Shelley home and Git repository were used to create an actual overlap between the prior asynchronous Shelley `end-of-turn` hook and the next `chat-message`. The previously recorded `v0.1.0` artifact was not changed.
+
+Method:
+
+```bash
+ROOT=$(mktemp -d /tmp/qual-v010-overlap.XXXXXX)
+export HOME=$ROOT/home
+export SHELLEY_DB=$HOME/.config/shelley/shelley.db
+export SHELLEY_HOOKS_DIR=$HOME/.config/shelley/hooks
+export ENTIRE_SHELLEY_HOOK_STATE=$HOME/.config/entire/shelley-hooks
+export ENTIRE_SHELLEY_CACHE=$HOME/.cache/entire-agent-shelley
+export PATH=$HOME/.local/bin:$(dirname "$(command -v entire)"):/usr/local/bin:/usr/bin:/bin
+unset SHELLEY_CONVERSATION_ID SHELLEY_CWD SHELLEY_GIT_ROOT ENTIRE_REPO_ROOT
+ln -s /home/exedev/entire-agent-shelley/entire-agent-shelley \
+  $HOME/.local/bin/entire-agent-shelley
+```
+
+Inside `$ROOT/repo`, Git was initialized with only synthetic content and Entire was enabled with telemetry disabled:
+
+```bash
+entire enable --agent shelley --project --telemetry=false \
+  --checkpoint-backend branch
+```
+
+Before enabling, a preserved synthetic Shelley `end-of-turn` hook was installed under the disposable `$SHELLEY_HOOKS_DIR`. It read the hook JSON, logged `conversation_id`, slept for 3 seconds, and returned success. Entire's real CLI was invoked through an `ENTIRE_BIN` wrapper that appended each lifecycle command to `$ROOT/lifecycle.log` and then `exec`'d the real `entire` binary.
+
+Shelley was started only against the disposable database and socket:
+
+```bash
+shelley -predictable-only -disable-llm-integration \
+  -db "$SHELLEY_DB" serve \
+  -socket "$HOME/.config/shelley/shelley.sock" \
+  -port 0 -port-file "$ROOT/port"
+```
+
+The first turn was submitted in the background. As soon as the preserved hook logged `preserved-end-start`, the second turn was submitted concurrently against the same conversation ID:
+
+```bash
+shelley client -url unix://$SOCK chat -model predictable -cwd "$ROOT/repo" \
+  -p 'Synthetic overlap qualification turn one. Reply predictably.' &
+# wait until preserved-end-start appears
+shelley client -url unix://$SOCK chat -c cMYDVKW \
+  -p 'Synthetic overlap qualification turn two submitted during prior delayed end hook. Reply predictably.' &
+```
+
+A synthetic working-tree change was made while the first end hook was still sleeping so that the subsequent `TurnEnd` could associate the changed file with the session before Git checkpoint condensation.
+
+Results:
+
+```text
+conversation=cMYDVKW
+state_during_overlap={"active":true,"pending":["<base64 pending TurnStart payload>"]}
+final_state={"active":false,"pending":[]}
+checkpoint=ce4aa2369fb9
+commit=f97c1968cbf4808a47cda0576e07aa086944261a
+checkpoint_ref=d94f0190aa728edef6df35210301b0862abfd6e7
+transcript_path=ce/4aa2369fb9/0/transcript.jsonl
+```
+
+Entire lifecycle log order from the wrapper:
+
+```text
+2026-07-26T20:21:21.862195349Z entire hooks shelley session-start cwd=/tmp/qual-v010-overlap.F0BpYZ/repo conv=
+2026-07-26T20:21:22.046331093Z entire hooks shelley initial-turn-start cwd=/tmp/qual-v010-overlap.F0BpYZ/repo conv=
+2026-07-26T20:21:22.552258866Z submit-turn2 cMYDVKW
+2026-07-26T20:21:25.545663486Z entire hooks shelley turn-end cwd=/tmp/qual-v010-overlap.F0BpYZ/repo conv=
+2026-07-26T20:21:26.069941310Z entire hooks shelley turn-start cwd=/tmp/qual-v010-overlap.F0BpYZ/repo conv=
+2026-07-26T20:21:26.372502418Z entire hooks shelley turn-end cwd=/tmp/qual-v010-overlap.F0BpYZ/repo conv=
+```
+
+Preserved delayed hook log:
+
+```text
+2026-07-26T20:21:22.537223967Z preserved-end-start cMYDVKW
+2026-07-26T20:21:22.712461944Z preserved-end-start cMYDVKW
+2026-07-26T20:21:25.539794602Z preserved-end-finish cMYDVKW
+2026-07-26T20:21:25.714673053Z preserved-end-finish cMYDVKW
+```
+
+Verification:
+
+- Real overlap existed: turn two was submitted at `20:21:22.552Z`, while the prior preserved end hook was sleeping between `20:21:22.537Z` and `20:21:25.539Z`.
+- Prior `TurnEnd` reached Entire before the next `TurnStart`: lifecycle log line 4 was `entire hooks shelley turn-end`; line 5 was `entire hooks shelley turn-start`.
+- Pending lifecycle queue was populated during overlap (`active=true`, one pending payload) and drained afterward to `{"active":false,"pending":[]}` in the disposable cache state file, mode `0600`.
+- Shelley server logged two `end-of-turn hook applied` entries for conversation `cMYDVKW`.
+- Both prompts appeared in the checkpoint transcript at `ce/4aa2369fb9/0/transcript.jsonl`.
+- `git commit -m 'synthetic overlap qualification change'` succeeded and added `Entire-Checkpoint: ce4aa2369fb9`.
+- `entire checkpoint explain ce4aa2369fb9` reconstructed the checkpoint, listed `synthetic.txt`, and displayed both synthetic prompts in transcript order.
+- Fixture roots were disposable: `/tmp/qual-v010-overlap.F0BpYZ` and earlier failed `/tmp/qual-v010-overlap.*` attempts were removed after evidence capture. A post-run check found no remaining `/tmp/qual-v010-overlap.*` roots. No secrets, PII/NPPI, client-confidential, privileged, or license-restricted content was used.
