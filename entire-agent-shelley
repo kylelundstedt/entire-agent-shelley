@@ -1,9 +1,1219 @@
-#!/bin/sh
-# Compatibility alias for checkpoints created by the original Shelley-specific
-# prototype. New cross-agent use should call entire-agent-agentsview directly.
-set -eu
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export ENTIRE_AGENTSVIEW_ADAPTER_NAME=shelley
-export ENTIRE_AGENTSVIEW_ADAPTER_TYPE=Shelley
-export ENTIRE_AGENTSVIEW_AGENT_FILTER=shelley
-exec "$DIR/entire-agent-agentsview" "$@"
+#!/usr/bin/env python3
+"""Entire external-agent plugin for live Shelley authoring sessions.
+
+The plugin maps Shelley lifecycle hooks to Entire events and transactionally
+projects the matching conversation directly from Shelley SQLite at turn end.
+It preserves pre-existing Shelley hooks and treats Entire delivery as
+best-effort so capture failures do not block Shelley.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+PROTOCOL_VERSION = 1
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+HOOK_NAMES = (
+    "session-start",
+    "initial-turn-start",
+    "turn-start",
+    "turn-end",
+)
+SHELLEY_HOOK_FILES = ("new-conversation", "chat-message", "end-of-turn")
+HOOK_MARKER = "# Entire Shelley live-plugin hook v1"
+
+
+def fail(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def emit(value: Any) -> None:
+    json.dump(value, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def db_path() -> Path:
+    return Path(os.environ.get("SHELLEY_DB", "~/.config/shelley/shelley.db")).expanduser()
+
+
+def cache_root() -> Path:
+    configured = os.environ.get("ENTIRE_SHELLEY_CACHE")
+    if configured:
+        return Path(configured).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path("~/.cache").expanduser()
+    return base / "entire-agent-shelley"
+
+
+def hooks_root() -> Path:
+    configured = os.environ.get("SHELLEY_HOOKS_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path("~/.config/shelley/hooks").expanduser().resolve()
+
+
+def hook_state_root() -> Path:
+    configured = os.environ.get("ENTIRE_SHELLEY_HOOK_STATE")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path("~/.config/entire/shelley-hooks").expanduser().resolve()
+
+
+def adapter_path() -> Path:
+    return Path(__file__).resolve()
+
+
+def installed_adapter_path() -> Path:
+    return hook_state_root() / "bin" / "entire-agent-shelley"
+
+
+def registration_path() -> Path:
+    return hook_state_root() / "registrations.json"
+
+
+def registered_repos() -> set[str]:
+    path = registration_path()
+    if not path.is_file():
+        return set()
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"reading Shelley hook registrations: {exc}")
+    repos = value.get("repositories") if isinstance(value, dict) else None
+    if not isinstance(repos, list) or not all(isinstance(repo, str) for repo in repos):
+        fail("invalid Shelley hook registrations")
+    return set(repos)
+
+
+def write_registered_repos(repos: set[str]) -> None:
+    atomic_write(
+        registration_path(),
+        (json.dumps({"repositories": sorted(repos)}, indent=2) + "\n").encode(),
+        0o600,
+    )
+
+
+def install_stable_adapter() -> None:
+    target = installed_adapter_path()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.parent.chmod(0o700)
+    atomic_write(target, adapter_path().read_bytes(), 0o700)
+
+
+def entire_path() -> str:
+    configured = os.environ.get("ENTIRE_BIN")
+    if configured:
+        return str(Path(configured).expanduser())
+    return shutil.which("entire") or "entire"
+
+
+def connect() -> sqlite3.Connection:
+    path = db_path()
+    if not path.is_file():
+        fail(f"Shelley database not found: {path}")
+    uri = f"file:{path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        fail(f"opening Shelley database: {exc}")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def schema_present() -> bool:
+    path = db_path()
+    if not path.is_file():
+        return False
+    try:
+        with connect() as conn:
+            conversations = table_columns(conn, "conversations")
+            messages = table_columns(conn, "messages")
+            return {
+                "conversation_id",
+                "slug",
+                "cwd",
+                "model",
+                "parent_conversation_id",
+                "created_at",
+                "updated_at",
+            }.issubset(conversations) and {
+                "message_id",
+                "conversation_id",
+                "sequence_id",
+                "type",
+                "llm_data",
+                "created_at",
+                "model_name",
+            }.issubset(messages)
+    except SystemExit:
+        return False
+    except sqlite3.Error:
+        return False
+
+
+def validate_session_id(session_id: str) -> str:
+    if not SESSION_ID_RE.fullmatch(session_id):
+        fail(f"invalid Shelley conversation ID: {session_id!r}")
+    return session_id
+
+
+def canonical_repo(path: str | Path) -> Path:
+    path = Path(path).expanduser().resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        fail(f"not inside a Git worktree: {path}: {exc}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def current_repo() -> Path | None:
+    raw = os.environ.get("ENTIRE_REPO_ROOT")
+    return canonical_repo(raw) if raw else None
+
+
+def repo_cache_dir(repo: Path) -> Path:
+    digest = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+    return cache_root() / digest
+
+
+def ensure_secure_dir(path: Path) -> Path:
+    root = cache_root().expanduser().resolve()
+    resolved = path.expanduser().resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        fail(f"Shelley adapter cache path is outside its root: {resolved}")
+    for target in (root, resolved):
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stat = target.stat()
+        if stat.st_uid != os.getuid():
+            fail(f"Shelley adapter cache is not owned by the current user: {target}")
+        target.chmod(0o700)
+    return resolved
+
+
+def validate_session_dir(path: str | Path) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    root = cache_root().resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        fail(f"session directory is outside the Shelley adapter cache: {resolved}")
+    repo = current_repo()
+    if repo is not None and resolved != repo_cache_dir(repo).resolve():
+        fail(f"session directory does not match the current repository: {resolved}")
+    return resolved
+
+
+def parse_json(raw: str | None, fallback: Any) -> Any:
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def iso8601(raw: str | None) -> str:
+    if not raw:
+        return ""
+    value = raw.replace(" ", "T", 1)
+    if value.endswith("Z") or re.search(r"[+-]\d\d:\d\d$", value):
+        return value
+    try:
+        parsed = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+        return parsed.isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return value + "Z"
+
+
+def conversation(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT conversation_id, slug, cwd, model, parent_conversation_id, "
+        "created_at, updated_at FROM conversations WHERE conversation_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        fail(f"Shelley conversation not found: {session_id}")
+    if row["parent_conversation_id"] and os.environ.get("ENTIRE_SHELLEY_ALLOW_SUBAGENT") != "1":
+        fail(
+            f"Shelley conversation {session_id} is a subagent; "
+            "set ENTIRE_SHELLEY_ALLOW_SUBAGENT=1 to attach it explicitly"
+        )
+    return row
+
+
+def ensure_repo_match(row: sqlite3.Row, expected_repo: Path | None) -> Path:
+    cwd = row["cwd"]
+    if not cwd:
+        fail(f"Shelley conversation {row['conversation_id']} has no cwd")
+    repo = canonical_repo(cwd)
+    if expected_repo is not None and repo != expected_repo:
+        fail(
+            f"conversation belongs to {repo}, not current repository {expected_repo}"
+        )
+    return repo
+
+
+def content_parts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    content = data.get("Content")
+    return content if isinstance(content, list) else []
+
+
+def tool_input(part: dict[str, Any]) -> Any:
+    value = part.get("ToolInput")
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return parse_json(value, {"raw": value})
+    return value
+
+
+def tool_result_text(part: dict[str, Any]) -> str:
+    results = part.get("ToolResult")
+    if not isinstance(results, list) or not results:
+        return ""
+    if os.environ.get("ENTIRE_SHELLEY_INCLUDE_TOOL_RESULTS") != "1":
+        return "[tool result omitted by Shelley adapter data-minimization policy]"
+    texts: list[str] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        text = result.get("Text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return "\n".join(texts)
+
+
+def projected_content(message_type: str, data: dict[str, Any]) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
+    for part in content_parts(data):
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("Type")
+        allowed = {"user": {2, 6}, "agent": {2, 3, 5, 7}}[message_type]
+        if kind not in allowed:
+            fail(f"unsupported Shelley content type {kind!r} in {message_type} message")
+        if message_type == "user":
+            if kind == 2 and isinstance(part.get("Text"), str) and part["Text"]:
+                projected.append({"type": "text", "text": part["Text"]})
+            elif kind == 6:
+                result = tool_result_text(part)
+                if result:
+                    projected.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": part.get("ToolUseID") or part.get("ID") or "",
+                            "content": result,
+                            "is_error": bool(part.get("ToolError")),
+                        }
+                    )
+        elif message_type == "agent":
+            if kind == 2 and isinstance(part.get("Text"), str) and part["Text"]:
+                projected.append({"type": "text", "text": part["Text"]})
+            elif kind in (5, 7) and part.get("ToolName"):
+                projected.append(
+                    {
+                        "type": "tool_use",
+                        "id": part.get("ID") or part.get("ToolUseID") or "",
+                        "name": part["ToolName"],
+                        "input": tool_input(part),
+                    }
+                )
+            # Shelley Type 3 is model reasoning. It is intentionally excluded.
+    return projected
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def iter_messages(
+    conn: sqlite3.Connection, session_id: str
+) -> list[sqlite3.Row]:
+    excluded_filter = " AND excluded_from_context = 0" if "excluded_from_context" in table_columns(conn, "messages") else ""
+    return conn.execute(
+        "SELECT message_id, sequence_id, type, llm_data, created_at, model_name "
+        "FROM messages WHERE conversation_id = ? "
+        "AND type IN ('user','agent')" + excluded_filter + " ORDER BY sequence_id",
+        (session_id,),
+    ).fetchall()
+
+
+def project_transcript(
+    conn: sqlite3.Connection, session_id: str
+) -> tuple[bytes, list[str]]:
+    lines: list[bytes] = []
+    touched: set[str] = set()
+    for row in iter_messages(conn, session_id):
+        try:
+            data = json.loads(row["llm_data"] or "")
+        except json.JSONDecodeError as exc:
+            fail(
+                f"invalid llm_data in Shelley message {row['message_id']}: {exc}"
+            )
+        if not isinstance(data, dict):
+            fail(f"non-object llm_data in Shelley message {row['message_id']}")
+        parts = projected_content(row["type"], data)
+        if not parts:
+            continue
+        role = "assistant" if row["type"] == "agent" else "user"
+        message: dict[str, Any] = {"role": role, "content": parts}
+        if role == "assistant" and row["model_name"]:
+            message["model"] = row["model_name"]
+        line = {
+            "type": role,
+            "uuid": row["message_id"],
+            "timestamp": iso8601(row["created_at"]),
+            "message": message,
+            "shelley": {"sequence_id": row["sequence_id"]},
+        }
+        lines.append(json.dumps(line, separators=(",", ":")).encode() + b"\n")
+        touched.update(extract_paths(parts))
+    if not lines:
+        fail(f"Shelley conversation has no projectable messages: {session_id}")
+    return b"".join(lines), sorted(touched)
+
+
+def extract_paths(parts: list[dict[str, Any]]) -> set[str]:
+    repo = current_repo()
+    if repo is None:
+        return set()
+    found: set[str] = set()
+    for part in parts:
+        if part.get("type") != "tool_use":
+            continue
+        value = part.get("input")
+        if not isinstance(value, dict):
+            continue
+        for key in ("path", "file_path", "notebook_path"):
+            raw = value.get(key)
+            if not isinstance(raw, str) or not raw:
+                continue
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = repo / candidate
+            try:
+                relative = candidate.resolve().relative_to(repo)
+            except ValueError:
+                continue
+            found.add(relative.as_posix())
+    return found
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def materialize(session_id: str, session_dir: Path) -> tuple[Path, dict[str, Any]]:
+    validate_session_id(session_id)
+    expected = current_repo()
+    with connect() as conn:
+        conn.execute("BEGIN")
+        row = conversation(conn, session_id)
+        repo = ensure_repo_match(row, expected)
+        transcript, touched = project_transcript(conn, session_id)
+        path = session_dir / f"{session_id}.jsonl"
+        metadata = {
+            "session_id": session_id,
+            "agent_name": "shelley",
+            "repo_path": str(repo),
+            "session_ref": str(path),
+            "start_time": iso8601(row["created_at"]),
+            "modified_files": touched,
+            "new_files": [],
+            "deleted_files": [],
+            "conversation": {
+                "slug": row["slug"],
+                "model": row["model"],
+                "parent_conversation_id": row["parent_conversation_id"],
+                "updated_at": iso8601(row["updated_at"]),
+            },
+        }
+    atomic_write(path, transcript)
+    atomic_write(
+        path.with_suffix(".session.json"),
+        (json.dumps(metadata, indent=2) + "\n").encode(),
+    )
+    return path, metadata
+
+
+def arg_value(args: list[str], name: str) -> str:
+    try:
+        index = args.index(name)
+        return args[index + 1]
+    except (ValueError, IndexError):
+        fail(f"missing required argument {name}")
+
+
+def stdin_json() -> dict[str, Any]:
+    raw = sys.stdin.buffer.read()
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON on stdin: {exc}")
+    return value if isinstance(value, dict) else {}
+
+
+def hook_state_path(name: str) -> Path:
+    return hook_state_root() / f"{name}.json"
+
+
+def read_hook_state(name: str) -> dict[str, Any] | None:
+    path = hook_state_path(name)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"reading Shelley hook state for {name}: {exc}")
+    if not isinstance(value, dict) or value.get("hook") != name:
+        fail(f"invalid Shelley hook state for {name}")
+    return value
+
+
+def hook_is_ours(path: Path) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        content = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return content.startswith(f"#!/bin/sh\n{HOOK_MARKER}\n") and " run-hook --hook " in content
+
+
+def preserve_existing_hook(name: str, path: Path) -> dict[str, Any]:
+    state: dict[str, Any] = {"hook": name, "original": {"kind": "absent"}}
+    if path.is_symlink():
+        state["original"] = {"kind": "symlink", "target": os.readlink(path)}
+        path.unlink()
+    elif path.exists():
+        backup = hook_state_root() / "originals" / name
+        backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        backup.parent.chmod(0o700)
+        if backup.exists() or backup.is_symlink():
+            fail(f"Shelley hook backup already exists: {backup}")
+        mode = path.stat().st_mode & 0o777
+        path.replace(backup)
+        state["original"] = {
+            "kind": "file",
+            "path": str(backup),
+            "mode": mode,
+            "executable": bool(mode & 0o111),
+        }
+    return state
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def hook_script(name: str) -> bytes:
+    adapter = shell_quote(str(installed_adapter_path()))
+    runtime = shell_quote(str(hook_state_root() / "runtime"))
+    prior = prior_hook_command(name)
+    fallback = "exit 0"
+    if prior:
+        fallback = f"exec {shell_quote(prior[0])}"
+    return (
+        "#!/bin/sh\n"
+        f"{HOOK_MARKER}\n"
+        f"if [ ! -x {adapter} ]; then {fallback}; fi\n"
+        f"status_dir={runtime}\n"
+        "status_file=$status_dir/prior-$$\n"
+        "rm -f \"$status_file\"\n"
+        f"ENTIRE_SHELLEY_PRIOR_STATUS=\"$status_file\" {adapter} run-hook --hook {shell_quote(name)}\n"
+        "rc=$?\n"
+        "if [ -f \"$status_file\" ]; then\n"
+        "  prior_rc=$(cat \"$status_file\" 2>/dev/null || printf '1')\n"
+        "  rm -f \"$status_file\"\n"
+        "  exit \"$prior_rc\"\n"
+        "fi\n"
+        "exit 0\n"
+    ).encode()
+
+
+def install_one_hook(name: str, force: bool) -> bool:
+    root = hooks_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = root / name
+    state_root = hook_state_root()
+    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_root.chmod(0o700)
+    state_path = hook_state_path(name)
+
+    if hook_is_ours(path):
+        if not force:
+            return False
+        atomic_write(path, hook_script(name), 0o700)
+        return True
+    if state_path.exists():
+        fail(
+            f"Shelley hook {path} changed after Entire installation; "
+            "refusing to overwrite it"
+        )
+
+    state = preserve_existing_hook(name, path)
+    atomic_write(
+        state_path,
+        (json.dumps(state, indent=2) + "\n").encode(),
+        0o600,
+    )
+    atomic_write(path, hook_script(name), 0o700)
+    return True
+
+
+def install_hooks(force: bool) -> int:
+    repo = current_repo()
+    if repo is None:
+        fail("ENTIRE_REPO_ROOT is required for Shelley hook installation")
+    state_root = hook_state_root()
+    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_root.chmod(0o700)
+    runtime = state_root / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime.chmod(0o700)
+    install_stable_adapter()
+    repos = registered_repos()
+    repo_key = str(repo)
+    already_registered = repo_key in repos
+    repos.add(repo_key)
+    write_registered_repos(repos)
+    try:
+        return sum(
+            1 for name in SHELLEY_HOOK_FILES if install_one_hook(name, force)
+        )
+    except BaseException:
+        if not already_registered:
+            repos.discard(repo_key)
+            write_registered_repos(repos)
+        raise
+
+
+def restore_one_hook(name: str) -> None:
+    path = hooks_root() / name
+    state = read_hook_state(name)
+    if state is None:
+        return
+    if path.exists() or path.is_symlink():
+        if not hook_is_ours(path):
+            fail(f"Shelley hook {path} is no longer managed by Entire")
+        path.unlink()
+    original = state.get("original", {})
+    kind = original.get("kind")
+    if kind == "symlink":
+        path.symlink_to(str(original.get("target", "")))
+    elif kind == "file":
+        backup = Path(str(original.get("path", "")))
+        if not backup.is_file():
+            fail(f"missing preserved Shelley hook: {backup}")
+        backup.replace(path)
+        path.chmod(int(original.get("mode", 0o700)))
+    elif kind != "absent":
+        fail(f"unknown preserved Shelley hook kind: {kind!r}")
+    hook_state_path(name).unlink()
+
+
+def hooks_installed() -> bool:
+    repo = current_repo()
+    if repo is None or str(repo) not in registered_repos():
+        return False
+    return all(
+        hook_is_ours(hooks_root() / name) and read_hook_state(name) is not None
+        for name in SHELLEY_HOOK_FILES
+    )
+
+
+def prior_hook_command(name: str) -> list[str] | None:
+    state = read_hook_state(name)
+    if state is None:
+        return None
+    original = state.get("original", {})
+    kind = original.get("kind")
+    if kind == "symlink":
+        target = Path(str(original.get("target", "")))
+        if not target.is_absolute():
+            target = hooks_root() / target
+        resolved = target.resolve()
+        return [str(resolved)] if os.access(resolved, os.X_OK) else None
+    if kind == "file" and original.get("executable"):
+        resolved = Path(str(original.get("path", ""))).resolve()
+        return [str(resolved)] if os.access(resolved, os.X_OK) else None
+    return None
+
+
+def run_process(
+    command: list[str], raw: bytes, cwd: Path | None, timeout: float
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(raw, timeout=max(timeout, 0.1))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(command, timeout, stdout, stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def run_prior_hook(name: str, raw: bytes, timeout: float) -> bytes:
+    command = prior_hook_command(name)
+    if command is None:
+        return b""
+    try:
+        result = run_process(command, raw, None, timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"running preserved Shelley hook {name}: {exc}")
+    if result.returncode != 0:
+        if result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+        code = min(max(result.returncode, 1), 255)
+        record_prior_hook_failure(code)
+        raise SystemExit(1)
+    return result.stdout
+
+
+def conversation_id_from_hook(name: str, value: dict[str, Any]) -> str:
+    readonly = value.get("readonly")
+    if name in ("new-conversation", "chat-message") and isinstance(readonly, dict):
+        raw = readonly.get("conversation_id")
+    else:
+        raw = value.get("conversation_id")
+    return validate_session_id(str(raw or ""))
+
+
+def repo_for_hook(name: str, value: dict[str, Any], session_id: str) -> Path | None:
+    if name == "new-conversation":
+        readonly = value.get("readonly")
+        if isinstance(readonly, dict) and readonly.get("is_subagent"):
+            return None
+        raw = value.get("cwd")
+        if raw:
+            try:
+                return canonical_repo(str(raw))
+            except SystemExit:
+                return None
+    try:
+        with connect() as conn:
+            row = conversation(conn, session_id)
+            return ensure_repo_match(row, None)
+    except SystemExit:
+        return None
+
+
+def repo_entire_enabled(repo: Path) -> bool:
+    value: dict[str, Any] = {}
+    for name in ("settings.json", "settings.local.json"):
+        path = repo / ".entire" / name
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if isinstance(loaded, dict):
+            value.update(loaded)
+    return bool(value.get("enabled") and value.get("external_agents"))
+
+
+def append_hook_log(name: str, repo: Path | None, message: str) -> None:
+    try:
+        root = ensure_secure_dir(cache_root() / "logs")
+        line = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "hook": name,
+            "repo": str(repo) if repo else "",
+            "message": message[:500],
+        }
+        with (root / "hooks.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def dispatch_entire_hook(
+    repo: Path, hook_name: str, raw: bytes, timeout: float
+) -> None:
+    command = [entire_path(), "hooks", "shelley", hook_name]
+    try:
+        result = run_process(command, raw, repo, timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        append_hook_log(hook_name, repo, f"Entire hook unavailable: {exc}")
+        return
+    if result.returncode != 0:
+        append_hook_log(hook_name, repo, f"Entire hook failed with exit {result.returncode}")
+
+
+def merged_hook_input(name: str, raw: bytes, prior_output: bytes) -> bytes:
+    if name == "end-of-turn" or not prior_output.strip():
+        return raw
+    try:
+        original = json.loads(raw or b"{}")
+        updated = json.loads(prior_output)
+    except json.JSONDecodeError:
+        return prior_output
+    if not isinstance(original, dict) or not isinstance(updated, dict):
+        return prior_output
+    merged = dict(original)
+    merged.update(updated)
+    if isinstance(original.get("readonly"), dict) and isinstance(updated.get("readonly"), dict):
+        readonly = dict(original["readonly"])
+        readonly.update(updated["readonly"])
+        merged["readonly"] = readonly
+    return json.dumps(merged, separators=(",", ":")).encode()
+
+
+def lifecycle_root(repo: Path) -> Path:
+    return ensure_secure_dir(repo_cache_dir(repo) / "lifecycle")
+
+
+def lifecycle_paths(repo: Path, session_id: str) -> tuple[Path, Path]:
+    root = lifecycle_root(repo)
+    return root / f"{session_id}.lock", root / f"{session_id}.json"
+
+
+def read_lifecycle_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"active": False, "pending": []}
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"active": False, "pending": []}
+    if not isinstance(value, dict) or not isinstance(value.get("pending", []), list):
+        return {"active": False, "pending": []}
+    return {"active": bool(value.get("active")), "pending": value.get("pending", [])}
+
+
+def write_lifecycle_state(path: Path, state: dict[str, Any]) -> None:
+    atomic_write(path, (json.dumps(state, separators=(",", ":")) + "\n").encode(), 0o600)
+
+
+def pending_event(raw: bytes) -> str:
+    return base64.b64encode(raw).decode()
+
+
+def decode_pending_event(raw: Any) -> bytes | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError):
+        return None
+
+
+def registered_for_live_capture(repo: Path) -> bool:
+    return str(repo) in registered_repos() and repo_entire_enabled(repo)
+
+
+def record_prior_hook_failure(code: int) -> None:
+    raw = os.environ.get("ENTIRE_SHELLEY_PRIOR_STATUS")
+    if not raw:
+        return
+    path = Path(raw).expanduser().resolve()
+    runtime = (hook_state_root() / "runtime").resolve()
+    try:
+        path.relative_to(runtime)
+    except ValueError:
+        return
+    atomic_write(path, f"{code}\n".encode(), 0o600)
+
+
+def process_lifecycle_event(
+    name: str,
+    repo: Path,
+    session_id: str,
+    effective: bytes,
+    queued: bool,
+    deadline: float,
+) -> None:
+    lock_path, state_path = lifecycle_paths(repo, session_id)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        state = read_lifecycle_state(state_path)
+        pending = state["pending"]
+        if name == "new-conversation":
+            for hook_name in ("session-start", "initial-turn-start"):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    append_hook_log(name, repo, "Entire hook deadline exhausted")
+                    break
+                dispatch_entire_hook(repo, hook_name, effective, min(4, remaining))
+            state = {"active": True, "pending": []}
+        elif name == "chat-message":
+            if state["active"] or queued:
+                if len(pending) >= 32:
+                    append_hook_log(name, repo, "pending turn queue is full")
+                else:
+                    pending.append(pending_event(effective))
+                state["pending"] = pending
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    dispatch_entire_hook(repo, "turn-start", effective, min(4, remaining))
+                    state["active"] = True
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                dispatch_entire_hook(repo, "turn-end", effective, min(4, remaining))
+            state["active"] = False
+            while pending:
+                next_event = decode_pending_event(pending.pop(0))
+                if next_event is None:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    pending.insert(0, pending_event(next_event))
+                    break
+                dispatch_entire_hook(repo, "turn-start", next_event, min(4, remaining))
+                state["active"] = True
+                break
+            state["pending"] = pending
+        write_lifecycle_state(state_path, state)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def command_run_hook(args: list[str]) -> None:
+    name = arg_value(args, "--hook")
+    if name not in SHELLEY_HOOK_FILES:
+        fail(f"unsupported Shelley hook: {name}")
+    deadline = time.monotonic() + 27
+    raw = sys.stdin.buffer.read()
+    prior_output = run_prior_hook(name, raw, min(20, deadline - time.monotonic()))
+    effective = merged_hook_input(name, raw, prior_output)
+    try:
+        value = json.loads(effective or b"{}")
+        if not isinstance(value, dict):
+            raise ValueError("hook payload is not an object")
+        session_id = conversation_id_from_hook(name, value)
+        repo = repo_for_hook(name, value, session_id)
+        readonly = value.get("readonly")
+        queued = (
+            name == "chat-message"
+            and isinstance(readonly, dict)
+            and bool(readonly.get("queued"))
+        )
+        if repo is not None and registered_for_live_capture(repo):
+            process_lifecycle_event(
+                name, repo, session_id, effective, queued, deadline
+            )
+    except (json.JSONDecodeError, ValueError, SystemExit) as exc:
+        append_hook_log(name, None, f"skipped invalid hook payload: {exc}")
+    if prior_output:
+        sys.stdout.buffer.write(prior_output)
+
+
+def hook_payload(name: str) -> dict[str, Any]:
+    value = stdin_json()
+    session_id = conversation_id_from_hook(
+        "new-conversation" if name in ("session-start", "initial-turn-start") else (
+            "chat-message" if name == "turn-start" else "end-of-turn"
+        ),
+        value,
+    )
+    if name in ("session-start", "initial-turn-start"):
+        prompt = str(value.get("prompt") or "")
+        model = str(value.get("model") or "")
+        timestamp = ""
+    elif name == "turn-start":
+        prompt = str(value.get("message") or "")
+        readonly = value.get("readonly")
+        model = str(readonly.get("model") or "") if isinstance(readonly, dict) else ""
+        timestamp = ""
+    else:
+        prompt = ""
+        model = str(value.get("model") or "")
+        timestamp = str(value.get("timestamp") or "")
+    return {
+        "value": value,
+        "session_id": session_id,
+        "prompt": prompt,
+        "model": model,
+        "timestamp": timestamp,
+    }
+
+
+def command_parse_hook(args: list[str]) -> None:
+    name = arg_value(args, "--hook")
+    if name not in HOOK_NAMES:
+        fail(f"unsupported Entire Shelley hook: {name}")
+    payload = hook_payload(name)
+    session_id = payload["session_id"]
+    repo = current_repo()
+    session_ref = ""
+    if repo is not None:
+        session_dir = ensure_secure_dir(repo_cache_dir(repo))
+        session_ref = str(session_dir / f"{session_id}.jsonl")
+        if name == "turn-end":
+            materialize(session_id, session_dir)
+    event_type = {
+        "session-start": 1,
+        "initial-turn-start": 2,
+        "turn-start": 2,
+        "turn-end": 3,
+    }[name]
+    event: dict[str, Any] = {
+        "type": event_type,
+        "session_id": session_id,
+        "session_ref": session_ref,
+        "model": payload["model"],
+        "timestamp": payload["timestamp"],
+        "metadata": {"source_agent": "shelley", "shelley_hook": name},
+    }
+    if event_type == 2:
+        event["prompt"] = payload["prompt"]
+    if event_type == 3:
+        event["response_message"] = str(payload["value"].get("final_response") or "")
+    emit({key: value for key, value in event.items() if value not in ("", None)})
+
+
+def command_install_hooks(args: list[str]) -> None:
+    emit({"hooks_installed": install_hooks("--force" in args)})
+
+
+def command_uninstall_hooks() -> None:
+    repo = current_repo()
+    if repo is None:
+        fail("ENTIRE_REPO_ROOT is required for Shelley hook removal")
+    repos = registered_repos()
+    repos.discard(str(repo))
+    write_registered_repos(repos)
+    if not repos:
+        for name in SHELLEY_HOOK_FILES:
+            restore_one_hook(name)
+        try:
+            installed_adapter_path().unlink()
+        except FileNotFoundError:
+            pass
+    emit({})
+
+
+def command_are_hooks_installed() -> None:
+    emit({"installed": hooks_installed()})
+
+
+def command_info() -> None:
+    emit(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "name": "shelley",
+            "type": "Shelley",
+            "description": "Shelley direct SQLite adapter with live lifecycle hooks",
+            "is_preview": True,
+            "protected_dirs": [str(hook_state_root())],
+            "protected_files": [str(db_path())],
+            "hook_names": list(HOOK_NAMES),
+            "capabilities": {
+                "hooks": True,
+                "transcript_analyzer": False,
+                "transcript_preparer": False,
+                "token_calculator": False,
+                "text_generator": False,
+                "hook_response_writer": False,
+                "subagent_aware_extractor": False,
+            },
+        }
+    )
+
+
+def command_detect() -> None:
+    emit({"present": schema_present()})
+
+
+def command_get_session_id() -> None:
+    value = stdin_json()
+    raw = value.get("session_id")
+    if not raw and isinstance(value.get("raw_data"), dict):
+        raw = value["raw_data"].get("conversation_id")
+    emit({"session_id": validate_session_id(str(raw or ""))})
+
+
+def command_get_session_dir(args: list[str]) -> None:
+    repo = canonical_repo(arg_value(args, "--repo-path"))
+    path = ensure_secure_dir(repo_cache_dir(repo))
+    emit({"session_dir": str(path)})
+
+
+def command_resolve_session_file(args: list[str]) -> None:
+    session_dir = validate_session_dir(arg_value(args, "--session-dir"))
+    session_id = validate_session_id(arg_value(args, "--session-id"))
+    path, _ = materialize(session_id, session_dir)
+    emit({"session_file": str(path)})
+
+
+def command_read_session() -> None:
+    value = stdin_json()
+    session_id = validate_session_id(str(value.get("session_id") or ""))
+    repo = current_repo()
+    if repo is None:
+        fail("ENTIRE_REPO_ROOT is required for read-session")
+    _, metadata = materialize(session_id, ensure_secure_dir(repo_cache_dir(repo)))
+    native = json.dumps(metadata.pop("conversation"), separators=(",", ":")).encode()
+    metadata["native_data"] = base64.b64encode(native).decode()
+    emit(metadata)
+
+
+def command_write_session() -> None:
+    _ = stdin_json()
+    fail(
+        "write-session is unsupported by the Shelley live plugin; "
+        "rewind/resume restoration is not implemented"
+    )
+
+
+def validate_transcript_path(raw: str) -> Path:
+    repo = current_repo()
+    if repo is None:
+        fail("ENTIRE_REPO_ROOT is required for read-transcript")
+    path = Path(raw).expanduser().resolve()
+    expected_dir = repo_cache_dir(repo).resolve()
+    if path.parent != expected_dir or path.suffix != ".jsonl":
+        fail(f"session transcript does not belong to the current repository: {path}")
+    session_id = validate_session_id(path.stem)
+    sidecar = path.with_suffix(".session.json")
+    try:
+        metadata = json.loads(sidecar.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"reading Shelley session metadata: {exc}")
+    if (
+        metadata.get("session_id") != session_id
+        or Path(metadata.get("repo_path", "")).resolve() != repo
+        or Path(metadata.get("session_ref", "")).resolve() != path
+    ):
+        fail(f"Shelley session metadata does not match transcript: {path}")
+    return path
+
+
+def command_read_transcript(args: list[str]) -> None:
+    path = validate_transcript_path(arg_value(args, "--session-ref"))
+    try:
+        sys.stdout.buffer.write(path.read_bytes())
+    except OSError as exc:
+        fail(f"reading transcript: {exc}")
+
+
+def command_chunk_transcript(args: list[str]) -> None:
+    try:
+        maximum = int(arg_value(args, "--max-size"))
+    except ValueError:
+        fail("--max-size must be an integer")
+    if maximum <= 0:
+        fail("--max-size must be positive")
+    raw = sys.stdin.buffer.read()
+    chunks = [
+        base64.b64encode(raw[index : index + maximum]).decode()
+        for index in range(0, len(raw), maximum)
+    ]
+    emit({"chunks": chunks})
+
+
+def command_reassemble_transcript() -> None:
+    value = stdin_json()
+    chunks = value.get("chunks")
+    if not isinstance(chunks, list):
+        fail("chunks must be an array")
+    try:
+        raw = b"".join(base64.b64decode(chunk, validate=True) for chunk in chunks)
+    except (TypeError, ValueError) as exc:
+        fail(f"invalid base64 chunk: {exc}")
+    sys.stdout.buffer.write(raw)
+
+
+def command_format_resume(args: list[str]) -> None:
+    session_id = validate_session_id(arg_value(args, "--session-id"))
+    emit({"command": f"shelley client chat -c {session_id} -p '<continue>'"})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("command", nargs="?")
+    parsed, rest = parser.parse_known_args()
+    command = parsed.command
+    if command == "info":
+        command_info()
+    elif command == "detect":
+        command_detect()
+    elif command == "get-session-id":
+        command_get_session_id()
+    elif command == "get-session-dir":
+        command_get_session_dir(rest)
+    elif command == "resolve-session-file":
+        command_resolve_session_file(rest)
+    elif command == "read-session":
+        command_read_session()
+    elif command == "write-session":
+        command_write_session()
+    elif command == "read-transcript":
+        command_read_transcript(rest)
+    elif command == "chunk-transcript":
+        command_chunk_transcript(rest)
+    elif command == "reassemble-transcript":
+        command_reassemble_transcript()
+    elif command == "format-resume-command":
+        command_format_resume(rest)
+    elif command == "parse-hook":
+        command_parse_hook(rest)
+    elif command == "install-hooks":
+        command_install_hooks(rest)
+    elif command == "uninstall-hooks":
+        command_uninstall_hooks()
+    elif command == "are-hooks-installed":
+        command_are_hooks_installed()
+    elif command == "run-hook":
+        command_run_hook(rest)
+    else:
+        fail(f"unsupported subcommand: {command or '<none>'}")
+
+
+if __name__ == "__main__":
+    main()
