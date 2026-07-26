@@ -9,7 +9,7 @@ Entire**.
 
 ## Status
 
-- Plugin version: `0.1.1`
+- Plugin version: `0.1.2`
 - Entire external-agent protocol: `v1`
 - Qualified Entire CLI: `0.8.42`
 - Platform: Linux

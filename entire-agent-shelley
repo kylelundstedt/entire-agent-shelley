@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 PROTOCOL_VERSION = 1
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOOK_NAMES = (
     "session-start",
@@ -693,11 +693,16 @@ def prior_hook_command(name: str) -> list[str] | None:
 
 
 def run_process(
-    command: list[str], raw: bytes, cwd: Path | None, timeout: float
+    command: list[str],
+    raw: bytes,
+    cwd: Path | None,
+    timeout: float,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     process = subprocess.Popen(
         command,
         cwd=cwd,
+        env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -790,12 +795,30 @@ def append_hook_log(name: str, repo: Path | None, message: str) -> None:
         pass
 
 
+def entire_hook_environment(command_path: str) -> dict[str, str]:
+    env = os.environ.copy()
+    candidates = [
+        str(adapter_path().parent),
+        str(installed_adapter_path().parent),
+        str(Path(command_path).expanduser().resolve().parent),
+        str(Path("~/.local/bin").expanduser()),
+    ]
+    existing = env.get("PATH", "")
+    if existing:
+        candidates.extend(existing.split(os.pathsep))
+    env["PATH"] = os.pathsep.join(dict.fromkeys(path for path in candidates if path))
+    return env
+
+
 def dispatch_entire_hook(
     repo: Path, hook_name: str, raw: bytes, timeout: float
 ) -> None:
-    command = [entire_path(), "hooks", "shelley", hook_name]
+    executable = entire_path()
+    command = [executable, "hooks", "shelley", hook_name]
     try:
-        result = run_process(command, raw, repo, timeout)
+        result = run_process(
+            command, raw, repo, timeout, entire_hook_environment(executable)
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         append_hook_log(hook_name, repo, f"Entire hook unavailable: {exc}")
         return

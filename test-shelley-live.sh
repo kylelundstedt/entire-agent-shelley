@@ -169,7 +169,8 @@ else
   cd "$REPO"
   entire enable --agent shelley --project --telemetry=false --checkpoint-backend branch >/dev/null
 )
-printf '%s' "$NEW_PAYLOAD" | "$HOOKS/new-conversation" >/dev/null
+ln -sf "$REAL_ENTIRE" "$BIN/entire"
+printf '%s' "$NEW_PAYLOAD" | PATH=/usr/bin:/bin "$HOOKS/new-conversation" >/dev/null
 printf 'changed\n' >>"$REPO/file.txt"
 python3 - "$DB" <<'PY'
 import json
@@ -191,7 +192,7 @@ conn.execute(
 )
 conn.commit()
 PY
-printf '%s' "$END_PAYLOAD" | "$HOOKS/end-of-turn" >/dev/null
+printf '%s' "$END_PAYLOAD" | PATH=/usr/bin:/bin "$HOOKS/end-of-turn" >/dev/null
 
 git -C "$REPO" add file.txt
 git -C "$REPO" commit -qm live
