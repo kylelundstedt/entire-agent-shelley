@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 PROTOCOL_VERSION = 1
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOOK_NAMES = (
     "session-start",
@@ -122,7 +122,17 @@ def entire_path() -> str:
     configured = os.environ.get("ENTIRE_BIN")
     if configured:
         return str(Path(configured).expanduser())
-    return shutil.which("entire") or "entire"
+    discovered = shutil.which("entire")
+    if discovered:
+        return discovered
+    for candidate in (
+        Path("~/.local/bin/entire").expanduser(),
+        Path("/usr/local/bin/entire"),
+        Path("/usr/bin/entire"),
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return "entire"
 
 
 def connect() -> sqlite3.Connection:

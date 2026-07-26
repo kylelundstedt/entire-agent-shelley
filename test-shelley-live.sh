@@ -145,6 +145,13 @@ set -e
 [[ $PRIOR_RC -eq 7 ]] || fail "preserved hook failure status was not propagated"
 mv "$ROOT/original-new-conversation.good" "$ROOT/original-new-conversation"
 chmod +x "$ROOT/original-new-conversation"
+cp "$ROOT/fake-entire" "$BIN/entire"
+chmod +x "$BIN/entire"
+: >"$ENTIRE_FAKE_ARGS"
+OUTPUT=$(printf '%s' "$NEW_PAYLOAD" | PATH=/usr/bin:/bin "$HOOKS/new-conversation")
+assert_jq "$OUTPUT" '.slug == "preserved"'
+[[ $(wc -l <"$ENTIRE_FAKE_ARGS") -eq 2 ]] || fail "plugin did not find ~/.local/bin/entire outside Shelley PATH"
+rm -f "$BIN/entire"
 : >"$ENTIRE_FAKE_ARGS"
 QUEUED='{"message":"later","readonly":{"conversation_id":"conv-live","model":"gpt-test","queued":true}}'
 printf '%s' "$QUEUED" | ENTIRE_BIN="$ROOT/fake-entire" "$HOOKS/chat-message" >/dev/null
