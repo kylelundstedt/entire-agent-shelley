@@ -6,6 +6,7 @@ trap 'rm -rf "$ROOT"' EXIT
 
 ADAPTER=$(cd "$(dirname "$0")" && pwd)/entire-agent-shelley
 REAL_ENTIRE=$(command -v entire || true)
+REAL_PYTHON=$(command -v python3 || true)
 TEST_HOME="$ROOT/home"
 REPO="$ROOT/repo"
 DB="$TEST_HOME/.config/shelley/shelley.db"
@@ -14,6 +15,8 @@ STATE="$TEST_HOME/.config/entire/shelley-hooks"
 CACHE="$TEST_HOME/.cache/entire-agent-shelley"
 BIN="$TEST_HOME/.local/bin"
 mkdir -p "$BIN" "$HOOKS" "$(dirname "$DB")"
+[[ -n "$REAL_PYTHON" ]] || { echo "python3 is required" >&2; exit 1; }
+ln -s "$REAL_PYTHON" "$BIN/python3"
 ln -s "$ADAPTER" "$BIN/entire-agent-shelley"
 
 export HOME="$TEST_HOME"

@@ -9,17 +9,24 @@ Entire**.
 
 ## Status
 
-- Plugin version: `0.1.2`
+- Plugin version: `0.1.3`
 - Entire external-agent protocol: `v1`
 - Qualified Entire CLI: `0.8.42`
 - Platform: Linux
 - Language/runtime: Python 3.11+
 - Rewind/write-back: unsupported
 - Shelley `SessionEnd`: unavailable; capture finalizes per turn
+- Executable SHA-256: `1541c304ce86e7b80b74d91a01348daa6a38dd53e068c856c3d832880a55f64e`
+- Current qualification: [`QUALIFICATION-v0.1.3.md`](QUALIFICATION-v0.1.3.md)
 
 The implementation originated in IndustryVault's `iv-docs` Spike 23. Its source
 history was extracted rather than squashed; the first standalone live-plugin
 commit corresponds to `iv-docs` commit `7d75e2d`.
+
+The executable uses a shell/Python polyglot launcher: it resolves
+`ENTIRE_SHELLEY_PYTHON`, then `~/.local/bin/python3`, then `python3` on `PATH`.
+This keeps managed Shelley hooks usable on minimal exe.dev images whose service
+`PATH` excludes the uv-managed user interpreter.
 
 ## Lifecycle
 

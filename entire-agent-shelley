@@ -1,4 +1,17 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+python_bin=${ENTIRE_SHELLEY_PYTHON:-"$HOME/.local/bin/python3"}
+if [ ! -x "$python_bin" ]; then
+  python_bin=$(command -v python3 2>/dev/null || true)
+fi
+if [ -z "$python_bin" ] || [ ! -x "$python_bin" ]; then
+  echo "entire-agent-shelley: Python 3 interpreter unavailable" >&2
+  exit 127
+fi
+exec "$python_bin" "$0" "$@"
+":"""
+from __future__ import annotations
+
 """Entire external-agent plugin for live Shelley authoring sessions.
 
 The plugin maps Shelley lifecycle hooks to Entire events and transactionally
@@ -6,8 +19,6 @@ projects the matching conversation directly from Shelley SQLite at turn end.
 It preserves pre-existing Shelley hooks and treats Entire delivery as
 best-effort so capture failures do not block Shelley.
 """
-
-from __future__ import annotations
 
 import argparse
 import base64
@@ -28,7 +39,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 PROTOCOL_VERSION = 1
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HOOK_NAMES = (
     "session-start",
