@@ -6,7 +6,7 @@ synthetic fixtures and the repository-scoped exe.dev GitHub integration.
 ## Prepare
 
 ```bash
-git clone https://github.int.exe.xyz/kylelundstedt/entire-agent-shelley.git \
+git clone https://github.com/kylelundstedt/entire-agent-shelley.git \
   /home/exedev/entire-agent-shelley
 cd /home/exedev/entire-agent-shelley
 git checkout v0.1.0

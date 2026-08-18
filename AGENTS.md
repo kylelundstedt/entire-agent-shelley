@@ -1,6 +1,6 @@
 # Agent guide — entire-agent-shelley
 
-This repository contains the private-preview Entire external-agent plugin for
+This repository contains the prototype Entire external-agent plugin for
 Shelley. The executable contract is `entire-agent-shelley`; repository naming
 must not change that discovery name.
 

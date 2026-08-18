@@ -1,6 +1,6 @@
 # entire-agent-shelley
 
-Private-preview [Entire](https://entire.io/) external-agent plugin for
+Prototype [Entire](https://entire.io/) external-agent plugin for
 [Shelley](https://exe.dev/docs/shelley/intro.md).
 
 The plugin captures Git-linked authoring context directly from Shelley's local

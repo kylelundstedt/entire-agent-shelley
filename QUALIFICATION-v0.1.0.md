@@ -4,6 +4,11 @@ Date: 2026-07-26 UTC
 VM: `iv-entire-agent-shelley`
 Verdict: **READY for Stage 2 authoring VM installation**
 
+> Historical record, reproduced verbatim. The clone commands below use the
+> `github.int.exe.xyz` exe.dev integration proxy, which is what was actually
+> run while this repository was private. Clone from
+> `https://github.com/kylelundstedt/entire-agent-shelley.git` instead.
+
 ## Checked artifact
 
 - Tag: `v0.1.0`
