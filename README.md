@@ -7,6 +7,10 @@ The plugin captures Git-linked authoring context directly from Shelley's local
 SQLite history. It is IV-authored and is **not yet shipped or supported by
 Entire**.
 
+The dedicated [`iv-entire-agent-shelley` qualification VM](vm/README.md) tests
+new plugin, CLI, runtime, image, and checkpoint-backend combinations before
+fleet provisioning pins change.
+
 ## Status
 
 - Plugin version: `0.1.3`
