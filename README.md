@@ -11,13 +11,13 @@ Entire**.
 
 - Plugin version: `0.1.3`
 - Entire external-agent protocol: `v1`
-- Qualified Entire CLI: `0.8.42`
+- Qualified Entire CLI: `0.10.1`
 - Platform: Linux
 - Language/runtime: Python 3.11+
 - Rewind/write-back: unsupported
 - Shelley `SessionEnd`: unavailable; capture finalizes per turn
 - Executable SHA-256: `1541c304ce86e7b80b74d91a01348daa6a38dd53e068c856c3d832880a55f64e`
-- Current qualification: [`QUALIFICATION-v0.1.3.md`](QUALIFICATION-v0.1.3.md)
+- Current qualification: [`QUALIFICATION-v0.1.3-cli0.10.1.md`](QUALIFICATION-v0.1.3-cli0.10.1.md)
 
 The implementation originated in IndustryVault's `iv-docs` Spike 23. Its source
 history was extracted rather than squashed; the first standalone live-plugin
