@@ -1,5 +1,7 @@
 # entire-agent-shelley
 
+> **Retired 2026-11-21, and the repository is archived.** IndustryVault retired Entire for now under a 30-day agent-transcript policy. The plugin was removed from the fleet with `uninstall.sh`. `v0.1.3` and its qualification records (`QUALIFICATION-v0.1.3-cli0.10.1.md`) remain the starting point if Shelley capture is revived; re-qualify against the then-current Entire CLI first.
+
 Prototype [Entire](https://entire.io/) external-agent plugin for
 [Shelley](https://exe.dev/docs/shelley/intro.md).
 
